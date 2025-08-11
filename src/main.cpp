@@ -401,13 +401,32 @@ void loop() {
 
     // Bieg – odczyt aktywnego GND na wejściach (N=0, 1..5)
     int8_t gear = -1;
-    if (digitalRead(PIN_N_BIEG) == LOW) gear = 0;
-    else if (digitalRead(PIN_1_BIEG) == LOW) gear = 1;
-    else if (digitalRead(PIN_2_BIEG) == LOW) gear = 2;
-    else if (digitalRead(PIN_3_BIEG) == LOW) gear = 3;
-    else if (digitalRead(PIN_4_BIEG) == LOW) gear = 4;
-    else if (digitalRead(PIN_5_BIEG) == LOW) gear = 5;
-    if (gear >= 0) currentGear = gear;
+    bool nLow = (digitalRead(PIN_N_BIEG) == LOW);
+    bool g1Low = (digitalRead(PIN_1_BIEG) == LOW);
+    bool g2Low = (digitalRead(PIN_2_BIEG) == LOW);
+    bool g3Low = (digitalRead(PIN_3_BIEG) == LOW);
+    bool g4Low = (digitalRead(PIN_4_BIEG) == LOW);
+    bool g5Low = (digitalRead(PIN_5_BIEG) == LOW);
+    if (nLow) gear = 0;
+    else if (g1Low) gear = 1;
+    else if (g2Low) gear = 2;
+    else if (g3Low) gear = 3;
+    else if (g4Low) gear = 4;
+    else if (g5Low) gear = 5;
+    static int8_t lastGearDebug = -9;
+    if (gear >= 0) {
+      currentGear = gear;
+      if (gear != lastGearDebug) {
+        Serial.printf("[GEAR] N=%d 1=%d 2=%d 3=%d 4=%d 5=%d -> gear=%d\n", nLow, g1Low, g2Low, g3Low, g4Low, g5Low, gear);
+        lastGearDebug = gear;
+      }
+    } else {
+      // brak aktywnego wejścia – log jednorazowy
+      if (lastGearDebug != -1) {
+        Serial.printf("[GEAR] brak aktywnego pinu N/1/2/3/4/5 (N=%d 1=%d 2=%d 3=%d 4=%d 5=%d)\n", nLow, g1Low, g2Low, g3Low, g4Low, g5Low);
+        lastGearDebug = -1;
+      }
+    }
 
     // Na razie prędkość stała 0 (do czasu podłączenia Halla)
     currentSpeed = 0;
