@@ -5,6 +5,7 @@
 
 #include <Arduino.h>
 #include <TFT_eSPI.h>
+#include <Wire.h>
 // Nowocześniejszy UI z gradientowym paskiem RPM, znacznikami oraz inną czcionką
 // GFX FreeFonts są opcjonalne (-DLOAD_GFXFF=1). Dodatkowo obsłużymy Smooth Font z plików .vlw.
 // Czcionki GFX są opcjonalne; włączone przez -DLOAD_GFXFF
@@ -51,6 +52,47 @@ static bool smoothFontsReady = false;
 static const char* FONT_SPEED_VLW = "/Final-Frontier48.vlw"; // duża czcionka prędkości i biegu
 static const char* FONT_LABEL_VLW = "/Final-Frontier24.vlw"; // etykiety
 
+// RGB LED (aktywne w stanie niskim zgodnie ze schematem – katody do GPIO)
+#define LED_R_PIN 17
+#define LED_G_PIN 4
+#define LED_B_PIN 16
+
+static inline void rgbWrite(bool rOn, bool gOn, bool bOn) {
+  // aktywne niskie: LOW = LED ON, HIGH = LED OFF
+  digitalWrite(LED_R_PIN, rOn ? LOW : HIGH);
+  digitalWrite(LED_G_PIN, gOn ? LOW : HIGH);
+  digitalWrite(LED_B_PIN, bOn ? LOW : HIGH);
+}
+
+// Dotyk rezystancyjny 4-przewodowy: X+, X-, Y+, Y-
+// Podłącz: Y+->IO32 (ADC1), X+->IO33 (ADC1), X-->IO25, Y-->IO26
+#define RES_YP 32
+#define RES_XP 33
+#define RES_XM 25
+#define RES_YM 26
+
+// Dolny panel: ODOMETER/TRIP/MOTO HOURS + logika potrójnego tapnięcia
+enum BottomMode { MODE_ODOM, MODE_TRIP, MODE_HOURS };
+static BottomMode bottomMode = MODE_ODOM;
+static float odomKm = 0.0f;   // całkowity przebieg [km]
+static float tripKm = 0.0f;   // przebieg dzienny [km]
+static float motoHours = 0.0f;// motogodziny [h]
+static uint32_t lastIntegrateMs = 0;
+// Single-tap switch (debounce) + filtry i autokalibracja
+static uint32_t lastSwitchMs = 0;
+static const uint32_t TOUCH_SWITCH_DEBOUNCE_MS = 300;
+static int touchEmaY = 0, touchEmaX = 0;
+static bool isPressed = false;
+static bool touchCalibrated = false;
+static uint32_t touchCalibStartMs = 0;
+static const uint32_t TOUCH_CALIB_MS = 1200;
+static int baseY = 0, baseX = 0;
+static int thrPressY = 0, thrReleaseY = 0;
+static int deltaMarginX = 250;
+static const bool TOUCH_DEBUG = true;
+
+static void drawBottomPanel();
+
 static void drawLabels() {
   // Czyścimy dolny pasek etykiet i rysujemy tylko podpis dla biegu
   tft.fillRect(AREA_LABEL.x, AREA_LABEL.y, AREA_LABEL.w, AREA_LABEL.h, TFT_BLACK);
@@ -60,6 +102,7 @@ static void drawLabels() {
     tft.setFreeFont(&FreeSansBold12pt7b);
   #endif
   tft.drawString("BIEG", AREA_GEAR.x, AREA_GEAR.y - 8);
+  drawBottomPanel();
 }
 
 static void drawRpmTrack() {
@@ -140,6 +183,7 @@ static void updateSpeed(uint16_t kmh) {
   #endif
   tft.setTextColor(TFT_CYAN, TFT_BLACK);
   tft.drawString("km/h", AREA_SPEED.x + AREA_SPEED.w / 2, AREA_SPEED.y + AREA_SPEED.h - 8);
+  drawBottomPanel();
 }
 
 static void updateGear(int8_t gear) {
@@ -167,6 +211,7 @@ static void updateGear(int8_t gear) {
       tft.drawString(g, AREA_GEAR.x + AREA_GEAR.w / 2, AREA_GEAR.y + AREA_GEAR.h / 2 + 6, 8);
     #endif
   }
+  drawBottomPanel();
 }
 
 void setup() {
@@ -188,6 +233,20 @@ void setup() {
     }
   }
 
+  // RGB LED
+  pinMode(LED_R_PIN, OUTPUT);
+  pinMode(LED_G_PIN, OUTPUT);
+  pinMode(LED_B_PIN, OUTPUT);
+  rgbWrite(false, false, false); // OFF
+
+  // Dotyk rezystancyjny – ustaw spoczynkowo wejścia
+  pinMode(RES_XP, INPUT);
+  pinMode(RES_XM, INPUT);
+  pinMode(RES_YP, INPUT);
+  pinMode(RES_YM, INPUT);
+  touchCalibrated = false;
+  touchCalibStartMs = millis();
+
   drawStaticUi();
   updateRpm(currentRpm);
   updateSpeed(currentSpeed);
@@ -204,6 +263,21 @@ void loop() {
     currentSpeed += 3; if (currentSpeed > 180) currentSpeed = 0;
     if (currentSpeed == 0) currentGear = 0; else currentGear = 1 + ((currentSpeed / 25) % 6);
 
+    // Sygnał zmiany biegu w górę: gdy prędkość rośnie i RPM > 9000
+    static uint16_t lastSpeed = 0;
+    bool suggestUpshift = (currentRpm > 9000 && currentSpeed > lastSpeed);
+    lastSpeed = currentSpeed;
+
+    // Miganie RGB (wszystkie kolory jednocześnie = biały) przy sugestii zmiany biegu
+    static bool rgbOn = false;
+    if (suggestUpshift) {
+      rgbOn = !rgbOn;
+      rgbWrite(rgbOn, rgbOn, rgbOn);
+    } else {
+      rgbOn = false;
+      rgbWrite(false, false, false);
+    }
+
     // Miganie całego ekranu na czerwono przy wysokich RPM
     static bool flashOn = false;         // stan klatki (czerwony/ekran UI)
     static bool wasFlashActive = false;  // czy poprzednio był aktywny alert
@@ -213,7 +287,7 @@ void loop() {
     if (flashActive) {
       flashOn = !flashOn;
       if (flashOn) {
-        tft.fillScreen(TFT_RED);
+        tft.fillScreen(TFT_BLUE);
       } else {
         drawStaticUi();
         updateSpeed(currentSpeed);
@@ -232,4 +306,92 @@ void loop() {
     updateSpeed(currentSpeed);
     updateGear(currentGear);
   }
+
+  // Detekcja pojedynczego tapnięcia – rezystancyjny
+  static uint32_t lastTouchPoll = 0;
+  if (millis() - lastTouchPoll > 25) {
+    lastTouchPoll = millis();
+    // Zasil X, czytaj Y+
+    pinMode(RES_XP, OUTPUT); digitalWrite(RES_XP, HIGH);
+    pinMode(RES_XM, OUTPUT); digitalWrite(RES_XM, LOW);
+    pinMode(RES_YP, INPUT);
+    int rawY = analogRead(RES_YP);
+    // Zasil Y, czytaj X+
+    pinMode(RES_YP, OUTPUT); digitalWrite(RES_YP, HIGH);
+    pinMode(RES_YM, OUTPUT); digitalWrite(RES_YM, LOW);
+    pinMode(RES_XP, INPUT);
+    int rawX = analogRead(RES_XP);
+
+    if (TOUCH_DEBUG && (millis() % 250 < 25)) {
+      Serial.printf("[TOUCH] rawY=%d rawX=%d\n", rawY, rawX);
+    }
+
+    touchEmaY = (int)(0.7f * touchEmaY + 0.3f * rawY);
+    touchEmaX = (int)(0.7f * touchEmaX + 0.3f * rawX);
+
+    if (!touchCalibrated && millis() - touchCalibStartMs >= TOUCH_CALIB_MS) {
+      baseY = touchEmaY; baseX = touchEmaX;
+      thrPressY = baseY + 250; thrReleaseY = baseY + 120;
+      touchCalibrated = true;
+      Serial.printf("[TOUCH] Calibrated baseY=%d baseX=%d thrP=%d thrR=%d\n", baseY, baseX, thrPressY, thrReleaseY);
+    }
+
+    bool active = (touchCalibrated && ((touchEmaY >= thrPressY) || (touchEmaX >= baseX + deltaMarginX)));
+    if (!isPressed && active) {
+      isPressed = true;
+      uint32_t now = millis();
+      if (now - lastSwitchMs > TOUCH_SWITCH_DEBOUNCE_MS) {
+        bottomMode = (BottomMode)(((int)bottomMode + 1) % 3);
+        drawBottomPanel();
+        Serial.println("[TOUCH] Single-tap -> switch panel");
+        lastSwitchMs = now;
+      }
+    } else if (isPressed && (touchEmaY <= thrReleaseY) && (touchEmaX <= baseX + (deltaMarginX/2))) {
+      isPressed = false;
+    }
+  }
+}
+
+static void drawBottomPanel() {
+  // Integrowanie dystansu i motogodzin
+  uint32_t now = millis();
+  if (lastIntegrateMs == 0) lastIntegrateMs = now;
+  uint32_t dt = now - lastIntegrateMs;
+  if (dt > 0) {
+    // dystans [km] = (km/h) * (dt[h])
+    float d_km = (float)currentSpeed * (dt / 3600000.0f);
+    odomKm += d_km;
+    tripKm += d_km;
+    // motogodziny: licz tylko gdy RPM > 0 (symulacja)
+    if (currentRpm > 0) motoHours += dt / 3600000.0f;
+    lastIntegrateMs = now;
+  }
+
+  // Render dolnego paska
+  tft.fillRect(AREA_LABEL.x, AREA_LABEL.y, AREA_LABEL.w, AREA_LABEL.h, TFT_BLACK);
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+  if (smoothFontsReady) {
+    tft.loadFont(FONT_LABEL_VLW);
+  } else {
+    #if HAS_FSB12
+      tft.setFreeFont(&FreeSansBold12pt7b);
+    #endif
+  }
+
+  char line[32];
+  switch (bottomMode) {
+    case MODE_ODOM:
+      snprintf(line, sizeof(line), "ODO %.1f km", odomKm);
+      break;
+    case MODE_TRIP:
+      snprintf(line, sizeof(line), "TRIP %.1f km", tripKm);
+      break;
+    case MODE_HOURS:
+      snprintf(line, sizeof(line), "MOTO %.1f h", motoHours);
+      break;
+  }
+  tft.drawString(line, AREA_LABEL.x + AREA_LABEL.w / 2, AREA_LABEL.y + AREA_LABEL.h / 2);
+
+  if (smoothFontsReady) tft.unloadFont();
 }
