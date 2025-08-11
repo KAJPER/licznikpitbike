@@ -54,16 +54,31 @@ static bool smoothFontsReady = false;
 static const char* FONT_SPEED_VLW = "/Final-Frontier48.vlw"; // duża czcionka prędkości i biegu
 static const char* FONT_LABEL_VLW = "/Final-Frontier24.vlw"; // etykiety
 
-// RGB LED (aktywne w stanie niskim zgodnie ze schematem – katody do GPIO)
-#define LED_R_PIN 17
-#define LED_G_PIN 4
+// LED sygnalizacyjny – użyjemy kanału B z RGB (IO16), aktywnie niski
 #define LED_B_PIN 16
+static inline void ledBlue(bool on) { digitalWrite(LED_B_PIN, on ? LOW : HIGH); }
 
-static inline void rgbWrite(bool rOn, bool gOn, bool bOn) {
-  // aktywne niskie: LOW = LED ON, HIGH = LED OFF
-  digitalWrite(LED_R_PIN, rOn ? LOW : HIGH);
-  digitalWrite(LED_G_PIN, gOn ? LOW : HIGH);
-  digitalWrite(LED_B_PIN, bOn ? LOW : HIGH);
+// Wejścia: RPM i biegi
+// RPM – wejście impulsów z cewki zapłonowej
+#define PIN_RPM     21
+// Czujniki biegów (aktywnie niskie: zwierają do masy)
+#define PIN_1_BIEG  32
+#define PIN_N_BIEG  26
+#define PIN_2_BIEG  25
+#define PIN_3_BIEG  5
+#define PIN_4_BIEG  4
+#define PIN_5_BIEG  17
+
+volatile uint32_t rpmPulseCount = 0;
+volatile uint32_t rpmLastIrqMs = 0;
+static const uint32_t RPM_IRQ_DEBOUNCE_MS = 2; // filtr zakłóceń z cewki
+
+static void IRAM_ATTR rpmIsr() {
+  uint32_t now = millis();
+  if (now - rpmLastIrqMs >= RPM_IRQ_DEBOUNCE_MS) {
+    rpmPulseCount++;
+    rpmLastIrqMs = now;
+  }
 }
 
 // --------------------------- Splash screen (XBM logo + progress) ---------------------------
@@ -338,11 +353,16 @@ void setup() {
     }
   }
 
-  // RGB LED
-  pinMode(LED_R_PIN, OUTPUT);
-  pinMode(LED_G_PIN, OUTPUT);
-  pinMode(LED_B_PIN, OUTPUT);
-  rgbWrite(false, false, false); // OFF
+  // Wejście RPM i biegi
+  pinMode(PIN_RPM, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(PIN_RPM), rpmIsr, FALLING);
+  pinMode(PIN_1_BIEG, INPUT_PULLUP);
+  pinMode(PIN_N_BIEG, INPUT_PULLUP);
+  pinMode(PIN_2_BIEG, INPUT_PULLUP);
+  pinMode(PIN_3_BIEG, INPUT_PULLUP);
+  pinMode(PIN_4_BIEG, INPUT_PULLUP);
+  pinMode(PIN_5_BIEG, INPUT_PULLUP);
+  pinMode(LED_B_PIN, OUTPUT); digitalWrite(LED_B_PIN, HIGH);
 
   // Dotyk rezystancyjny – ustaw spoczynkowo wejścia
   pinMode(RES_XP, INPUT);
@@ -364,24 +384,49 @@ void loop() {
   if (millis() - last > 200) {
     last = millis();
 
-    currentRpm += 350; if (currentRpm > 14500) currentRpm = 900;
-    currentSpeed += 3; if (currentSpeed > 180) currentSpeed = 0;
-    if (currentSpeed == 0) currentGear = 0; else currentGear = 1 + ((currentSpeed / 25) % 6);
-
-    // Sygnał zmiany biegu w górę: gdy prędkość rośnie i RPM > 9000
-    static uint16_t lastSpeed = 0;
-    bool suggestUpshift = (currentRpm > 9000 && currentSpeed > lastSpeed);
-    lastSpeed = currentSpeed;
-
-    // Miganie RGB (wszystkie kolory jednocześnie = biały) przy sugestii zmiany biegu
-    static bool rgbOn = false;
-    if (suggestUpshift) {
-      rgbOn = !rgbOn;
-      rgbWrite(rgbOn, rgbOn, rgbOn);
-    } else {
-      rgbOn = false;
-      rgbWrite(false, false, false);
+    // Realne RPM z liczby impulsów: 4T -> RPM = impulsy * 120 (imp/s * 60 * 2)
+    static uint32_t lastRpmCalcMs = millis();
+    uint32_t nowMs = millis();
+    uint32_t dtMs = nowMs - lastRpmCalcMs;
+    if (dtMs >= 250) { // okno 0.25 s
+      noInterrupts();
+      uint32_t pulses = rpmPulseCount; rpmPulseCount = 0;
+      interrupts();
+      float pulsesPerSec = (dtMs > 0) ? (pulses * 1000.0f / dtMs) : 0.0f;
+      float rpmf = pulsesPerSec * 120.0f; // dla 4-suwa
+      if (rpmf < 0) rpmf = 0; if (rpmf > 20000) rpmf = 20000;
+      currentRpm = (uint16_t)rpmf;
+      lastRpmCalcMs = nowMs;
     }
+
+    // Bieg – odczyt aktywnego GND na wejściach (N=0, 1..5)
+    int8_t gear = -1;
+    if (digitalRead(PIN_N_BIEG) == LOW) gear = 0;
+    else if (digitalRead(PIN_1_BIEG) == LOW) gear = 1;
+    else if (digitalRead(PIN_2_BIEG) == LOW) gear = 2;
+    else if (digitalRead(PIN_3_BIEG) == LOW) gear = 3;
+    else if (digitalRead(PIN_4_BIEG) == LOW) gear = 4;
+    else if (digitalRead(PIN_5_BIEG) == LOW) gear = 5;
+    if (gear >= 0) currentGear = gear;
+
+    // Na razie prędkość stała 0 (do czasu podłączenia Halla)
+    currentSpeed = 0;
+
+    // (opcjonalnie) sygnał zmiany biegu – na razie wyłączony
+
+    // Sygnał zmiany biegu przy 6000 RPM – miganie diodą LED (IO16, aktywnie LOW)
+    static bool shiftFlashOn = false;
+    static bool wasShiftActive = false;
+    const uint16_t SHIFT_RPM = 6000;
+    bool shiftActive = (currentRpm >= SHIFT_RPM && currentRpm < 10000);
+    if (shiftActive) {
+      shiftFlashOn = !shiftFlashOn;
+      ledBlue(shiftFlashOn);
+    } else if (wasShiftActive) {
+      ledBlue(false);
+      shiftFlashOn = false;
+    }
+    wasShiftActive = shiftActive;
 
     // Miganie całego ekranu na czerwono przy wysokich RPM
     static bool flashOn = false;         // stan klatki (czerwony/ekran UI)
@@ -397,12 +442,14 @@ void loop() {
         drawStaticUi();
         updateSpeed(currentSpeed);
         updateGear(currentGear);
+        updateRpm(currentRpm);
       }
     } else if (wasFlashActive) {
       // Schodzimy z odcinki – przywróć pełny UI
       drawStaticUi();
       updateSpeed(currentSpeed);
       updateGear(currentGear);
+      updateRpm(currentRpm);
       flashOn = false;
     }
     wasFlashActive = flashActive;
