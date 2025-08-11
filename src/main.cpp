@@ -6,6 +6,8 @@
 #include <Arduino.h>
 #include <TFT_eSPI.h>
 #include <Wire.h>
+#include <FS.h>
+// Możemy też użyć JPG; na razie używamy XBM i BMP z SPIFFS
 // Nowocześniejszy UI z gradientowym paskiem RPM, znacznikami oraz inną czcionką
 // GFX FreeFonts są opcjonalne (-DLOAD_GFXFF=1). Dodatkowo obsłużymy Smooth Font z plików .vlw.
 // Czcionki GFX są opcjonalne; włączone przez -DLOAD_GFXFF
@@ -62,6 +64,105 @@ static inline void rgbWrite(bool rOn, bool gOn, bool bOn) {
   digitalWrite(LED_R_PIN, rOn ? LOW : HIGH);
   digitalWrite(LED_G_PIN, gOn ? LOW : HIGH);
   digitalWrite(LED_B_PIN, bOn ? LOW : HIGH);
+}
+
+// --------------------------- Splash screen (XBM logo + progress) ---------------------------
+// Prosty 1-bit XBM (32x32) – ikona koła zębatych
+static const uint8_t SPLASH_W = 32;
+static const uint8_t SPLASH_H = 32;
+static const unsigned char splash_xbm[] PROGMEM = {
+  0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+  0x00,0x00,0x00,0x00,0x80,0x01,0x80,0x01,
+  0x40,0x02,0x40,0x02,0x20,0x04,0x20,0x04,
+  0x10,0x08,0x10,0x08,0x90,0x09,0x90,0x09,
+  0xd0,0x0b,0xd0,0x0b,0xf0,0x0f,0xf0,0x0f,
+  0xf0,0x0f,0xf0,0x0f,0xd0,0x0b,0xd0,0x0b,
+  0x90,0x09,0x90,0x09,0x10,0x08,0x10,0x08,
+  0x20,0x04,0x20,0x04,0x40,0x02,0x40,0x02,
+  0x80,0x01,0x80,0x01,0x00,0x00,0x00,0x00,
+  0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00
+};
+
+static void listSpiffs() {
+  if (!SPIFFS.begin(true)) { Serial.println("[SPIFFS] begin failed"); return; }
+  Serial.println("[SPIFFS] files:");
+  fs::File root = SPIFFS.open("/");
+  fs::File f = root.openNextFile();
+  while (f) {
+    Serial.printf("  %s (%u bytes)\n", f.name(), (unsigned)f.size());
+    f = root.openNextFile();
+  }
+}
+
+static const bool SPLASH_ROTATE_180 = true;
+
+static void showSplashScreen() {
+  bool bgDrawn = false;
+  // Tło: wczytaj /splash.bmp (24-bit, bez kompresji)
+  if (SPIFFS.begin(true) && SPIFFS.exists("/splash.bmp")) {
+    fs::File f = SPIFFS.open("/splash.bmp", "r");
+    if (f) {
+      uint16_t bfType = f.read() | (f.read() << 8);
+      if (bfType == 0x4D42) { // 'BM'
+        f.seek(10); uint32_t offset = f.read() | (f.read()<<8) | (f.read()<<16) | (f.read()<<24);
+        f.seek(18); int32_t w = f.read() | (f.read()<<8) | (f.read()<<16) | (f.read()<<24);
+        int32_t h = f.read() | (f.read()<<8) | (f.read()<<16) | (f.read()<<24);
+        f.seek(28); uint16_t bpp = f.read() | (f.read()<<8);
+        if (bpp != 24) { Serial.printf("[BMP] Unsupported bpp=%u (only 24)\n", bpp); f.close(); }
+        else {
+        f.seek(offset);
+        uint32_t rowSize = ((24 * w + 31) / 32) * 4;
+        std::unique_ptr<uint8_t[]> row(new uint8_t[rowSize]);
+        int startX = max(0, (tft.width() - (int)w) / 2);
+        int startY = max(0, (tft.height() - (int)h) / 2);
+        for (int y = h - 1; y >= 0; y--) {
+          f.read(row.get(), rowSize);
+          int drawY = SPLASH_ROTATE_180 ? (startY + y) : (startY + (h-1 - y));
+          if (drawY < 0 || drawY >= tft.height()) continue;
+          for (int x = 0; x < w; x++) {
+            int drawX = SPLASH_ROTATE_180 ? (startX + (w - 1 - x)) : (startX + x);
+            if (drawX < 0 || drawX >= tft.width()) continue;
+            // BMP przechowuje piksele w kolejności BGR – zamieniamy na 565
+            uint8_t b = row[x*3 + 0];
+            uint8_t g = row[x*3 + 1];
+            uint8_t r = row[x*3 + 2];
+            tft.drawPixel(drawX, drawY, ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3));
+          }
+        }
+        f.close();
+        bgDrawn = true;
+        Serial.printf("[BMP] Drawn splash %dx%d at (%d,%d)\n", (int)w, (int)h, startX, startY);
+        }
+      } else {
+        f.close();
+      }
+    }
+  }
+  if (!bgDrawn) {
+    tft.fillScreen(TFT_BLACK);
+  }
+
+  // Pasek postępu na dole (bez napisów/ikony)
+  // Napis w centrum podczas ładowania
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextColor(TFT_BLUE);
+  if (smoothFontsReady) {
+    tft.loadFont(FONT_LABEL_VLW);
+    tft.drawString("MADE BY KAJPA", tft.width()/2, tft.height()/2);
+    tft.unloadFont();
+  } else {
+    tft.drawString("MADE BY KAJPA", tft.width()/2, tft.height()/2, 4);
+  }
+
+  // Pasek postępu na dole
+  int bx = 20, by = tft.height() - 26, bw = tft.width() - 40, bh = 10;
+  tft.drawRoundRect(bx, by, bw, bh, 4, TFT_BLUE);
+  for (int p = 0; p <= 100; p += 4) {
+    int w = (bw - 2) * p / 100;
+    uint16_t c = tft.color565(30 + (p*2), 120, 160);
+    tft.fillRoundRect(bx + 1, by + 1, w, bh - 2, 3, c);
+    delay(12);
+  }
 }
 
 // Dotyk rezystancyjny 4-przewodowy: X+, X-, Y+, Y-
@@ -225,6 +326,10 @@ void setup() {
   tft.init();
   tft.setRotation(0);      // zawsze 0 (zgodnie z prośbą)
   tft.invertDisplay(false);
+
+  // Splash screen
+  showSplashScreen();
+  listSpiffs();
 
   // Inicjalizacja SPIFFS dla Smooth Font
   if (SPIFFS.begin(true)) {
